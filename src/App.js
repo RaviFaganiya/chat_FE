@@ -1,25 +1,21 @@
-import logo from './logo.svg';
-import './App.css';
+import React, { useState } from 'react';
+import { Routes, Route, Navigate } from 'react-router-dom';
+import CreateAccount from './component/auth/CreateAccount';
+import ChatNavigator from './component/chat/ChatNavigator';
 
 function App() {
+  const [isCreateAccount, setIsCreateAccount] = useState(
+    !!localStorage.getItem('token')
+  );
+
   return (
-    <div className="App">
-      <header className="App-header">
-        <img src={logo} className="App-logo" alt="logo" />
-        <p>
-          Edit <code>src/App.js</code> and save to reload.
-        </p>
-        <a
-          className="App-link"
-          href="https://reactjs.org"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Learn React
-        </a>
-      </header>
-    </div>
+    isCreateAccount ? (
+      <ChatNavigator setIsCreateAccount={setIsCreateAccount} />
+    ) : (
+      <CreateAccount setIsCreateAccount={setIsCreateAccount} />
+    )
   );
 }
 
 export default App;
+
