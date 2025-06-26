@@ -4157,19 +4157,13 @@ function Chat({ currentUser: propCurrentUser }) {
     isInCall: false,
     isInitiating: false,
     isReceiving: false,
-    callType: null, // "audio" | "video" | null
+    callType: null,
     remoteUserId: null,
   })
   const [isCallConnected, setIsCallConnected] = useState(false)
   const [isMuted, setIsMuted] = useState(false)
   const [isVideoEnabled, setIsVideoEnabled] = useState(true)
   const [callDuration, setCallDuration] = useState(0)
-
-  // Add these state variables after the existing states
-  const [connectionTimeout, setConnectionTimeout] = useState(null)
-  const [retryCount, setRetryCount] = useState(0)
-  const MAX_RETRY_COUNT = 3
-  const CONNECTION_TIMEOUT = 30000 // 30 seconds
 
   // Voice modal states
   const [showVoiceModal, setShowVoiceModal] = useState(false)
@@ -4186,19 +4180,24 @@ function Chat({ currentUser: propCurrentUser }) {
   const peerConnectionRef = useRef(null)
   const localStreamRef = useRef(null)
   const callTimerRef = useRef(null)
+  const connectionTimeoutRef = useRef(null)
 
-  // WebRTC configuration
+  // WebRTC configuration with multiple STUN servers
   const rtcConfiguration = {
-    iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }],
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "stun:stun2.l.google.com:19302" },
+      { urls: "stun:stun3.l.google.com:19302" },
+      { urls: "stun:stun4.l.google.com:19302" },
+    ],
+    iceCandidatePoolSize: 10,
   }
 
   // Group messages by date and format time
   const getDateGroup = (timestamp) => {
     const now = new Date()
     const messageDate = new Date(timestamp)
-    const diffInDays = Math.floor((now.getTime() - messageDate.getTime()) / (1000 * 60 * 60 * 24))
-
-    // Reset time to compare dates only
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
     const msgDate = new Date(messageDate.getFullYear(), messageDate.getMonth(), messageDate.getDate())
     const daysDiff = Math.floor((today.getTime() - msgDate.getTime()) / (1000 * 60 * 60 * 24))
@@ -4228,10 +4227,8 @@ function Chat({ currentUser: propCurrentUser }) {
     })
   }
 
-  // Group messages by date
   const groupMessagesByDate = (messages) => {
     const groups = {}
-
     messages.forEach((message) => {
       const dateGroup = getDateGroup(message.timestamp)
       if (!groups[dateGroup]) {
@@ -4239,7 +4236,6 @@ function Chat({ currentUser: propCurrentUser }) {
       }
       groups[dateGroup].push(message)
     })
-
     return groups
   }
 
@@ -4401,102 +4397,61 @@ function Chat({ currentUser: propCurrentUser }) {
     return () => {
       if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current)
       if (callTimerRef.current) clearInterval(callTimerRef.current)
+      if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current)
     }
   }, [id, isWindowFocused])
 
   // WebRTC Functions
-  const initializePeerConnection = useCallback(() => {
-    const peerConnection = new RTCPeerConnection(rtcConfiguration)
+  const createPeerConnection = useCallback(() => {
+    console.log("🔧 Creating new peer connection")
+    const pc = new RTCPeerConnection(rtcConfiguration)
 
-    peerConnection.onicecandidate = (event) => {
-      if (event.candidate && socket) {
-        console.log("🧊 Sending ICE candidate")
-        socket.emit("webrtc-ice-candidate", {
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        console.log("🧊 Sending ICE candidate:", event.candidate)
+        socket.emit("ice-candidate", {
           to: callState.remoteUserId || toUser._id,
           candidate: event.candidate,
         })
+      } else {
+        console.log("🧊 ICE gathering complete")
       }
     }
 
-    peerConnection.ontrack = (event) => {
-      console.log("📺 Received remote stream", event.streams[0])
+    pc.ontrack = (event) => {
+      console.log("📺 Received remote track:", event.track.kind)
       if (remoteVideoRef.current && event.streams[0]) {
+        console.log("📺 Setting remote stream")
         remoteVideoRef.current.srcObject = event.streams[0]
-        // Clear connection timeout when we receive remote stream
-        if (connectionTimeout) {
-          clearTimeout(connectionTimeout)
-          setConnectionTimeout(null)
-        }
-        // Ensure video plays
-        remoteVideoRef.current.play().catch(console.error)
+        remoteVideoRef.current.play().catch((e) => console.error("Remote video play error:", e))
       }
     }
 
-    peerConnection.onconnectionstatechange = () => {
-      console.log("🔗 Connection state:", peerConnection.connectionState)
-
-      if (peerConnection.connectionState === "connected") {
+    pc.onconnectionstatechange = () => {
+      console.log("🔗 Connection state changed:", pc.connectionState)
+      if (pc.connectionState === "connected") {
         setIsCallConnected(true)
         startCallTimer()
-        setRetryCount(0) // Reset retry count on successful connection
-        if (connectionTimeout) {
-          clearTimeout(connectionTimeout)
-          setConnectionTimeout(null)
+        if (connectionTimeoutRef.current) {
+          clearTimeout(connectionTimeoutRef.current)
+          connectionTimeoutRef.current = null
         }
-      } else if (peerConnection.connectionState === "disconnected") {
-        console.log("⚠️ Connection disconnected, attempting to reconnect...")
-        handleConnectionFailure()
-      } else if (peerConnection.connectionState === "failed") {
-        console.log("❌ Connection failed")
-        handleConnectionFailure()
-      } else if (peerConnection.connectionState === "connecting") {
-        console.log("🔄 Connection is connecting...")
-        // Set timeout for connection
-        const timeout = setTimeout(() => {
-          if (peerConnection.connectionState !== "connected") {
-            console.log("⏰ Connection timeout")
-            handleConnectionFailure()
-          }
-        }, CONNECTION_TIMEOUT)
-        setConnectionTimeout(timeout)
+      } else if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+        console.log("❌ Connection failed/disconnected")
+        endCall()
       }
     }
 
-    peerConnection.onicegatheringstatechange = () => {
-      console.log("🧊 ICE gathering state:", peerConnection.iceGatheringState)
-    }
-
-    peerConnection.oniceconnectionstatechange = () => {
-      console.log("🧊 ICE connection state:", peerConnection.iceConnectionState)
-
-      if (peerConnection.iceConnectionState === "failed") {
-        console.log("❌ ICE connection failed, attempting restart")
-        peerConnection.restartIce()
+    pc.oniceconnectionstatechange = () => {
+      console.log("🧊 ICE connection state:", pc.iceConnectionState)
+      if (pc.iceConnectionState === "failed") {
+        console.log("🔄 ICE failed, restarting...")
+        pc.restartIce()
       }
     }
 
-    return peerConnection
-  }, [callState.remoteUserId, toUser, connectionTimeout])
-
-  // Add connection failure handler
-  const handleConnectionFailure = () => {
-    if (retryCount < MAX_RETRY_COUNT) {
-      console.log(`🔄 Retrying connection (${retryCount + 1}/${MAX_RETRY_COUNT})`)
-      setRetryCount((prev) => prev + 1)
-
-      // Wait a bit before retrying
-      setTimeout(() => {
-        if (callState.isInCall && peerConnectionRef.current) {
-          // Try to restart ICE
-          peerConnectionRef.current.restartIce()
-        }
-      }, 2000)
-    } else {
-      console.log("❌ Max retries reached, ending call")
-      alert("Unable to establish connection. Please check your internet connection and try again.")
-      endCall()
-    }
-  }
+    return pc
+  }, [callState.remoteUserId, toUser])
 
   const startCallTimer = () => {
     setCallDuration(0)
@@ -4515,17 +4470,14 @@ function Chat({ currentUser: propCurrentUser }) {
     try {
       console.log(`📞 Starting ${callType} call to:`, toUser._id)
 
-      // Check available devices
-      const devices = await navigator.mediaDevices.enumerateDevices()
-      const hasAudio = devices.some((d) => d.kind === "audioinput")
-      const hasVideo = devices.some((d) => d.kind === "videoinput")
-
-      if (callType === "audio" && !hasAudio) {
-        alert("No microphone found. Please connect a microphone and try again.")
+      if (!toUser?._id || !currentUser?._id) {
+        alert("User information not available")
         return
       }
-      if (callType === "video" && !hasVideo) {
-        alert("No camera found. Please connect a camera and try again.")
+
+      // Check if user is online
+      if (!isUserOnline) {
+        alert("User is currently offline")
         return
       }
 
@@ -4537,54 +4489,54 @@ function Chat({ currentUser: propCurrentUser }) {
         remoteUserId: toUser._id,
       })
 
-      // Get user media with proper constraints
+      // Get user media
       const constraints = {
-        audio: hasAudio,
-        video:
-          callType === "video" && hasVideo
-            ? {
-                width: { ideal: 1280 },
-                height: { ideal: 720 },
-                facingMode: "user",
-              }
-            : false,
+        audio: true,
+        video: callType === "video" ? { width: 1280, height: 720, facingMode: "user" } : false,
       }
 
+      console.log("🎥 Getting user media with constraints:", constraints)
       const stream = await navigator.mediaDevices.getUserMedia(constraints)
       localStreamRef.current = stream
 
-      // Set local video stream and ensure it plays
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream
-        localVideoRef.current.muted = true // Prevent echo
-        localVideoRef.current.play().catch(console.error)
+        localVideoRef.current.muted = true
+        localVideoRef.current.play().catch((e) => console.error("Local video play error:", e))
       }
 
-      // Initialize peer connection
-      const peerConnection = initializePeerConnection()
-      peerConnectionRef.current = peerConnection
+      // Create peer connection
+      const pc = createPeerConnection()
+      peerConnectionRef.current = pc
 
-      // Add local stream to peer connection
+      // Add tracks to peer connection
       stream.getTracks().forEach((track) => {
-        peerConnection.addTrack(track, stream)
+        console.log("➕ Adding track:", track.kind)
+        pc.addTrack(track, stream)
       })
 
+      // Set connection timeout
+      connectionTimeoutRef.current = setTimeout(() => {
+        console.log("⏰ Call connection timeout")
+        alert("Call connection timeout. Please try again.")
+        endCall()
+      }, 30000)
+
       // Emit call initiation
-      if (socket) {
-        socket.emit("initiate-call", {
-          to: toUser._id,
-          from: currentUser._id,
-          callType,
-        })
-      }
+      console.log("📤 Emitting call initiation")
+      socket.emit("call-initiate", {
+        to: toUser._id,
+        from: currentUser._id,
+        callType,
+      })
     } catch (error) {
       console.error("❌ Error starting call:", error)
-      if (error.name === "NotFoundError") {
-        alert("Required device not found. Please check your camera/microphone.")
-      } else if (error.name === "NotAllowedError") {
-        alert("Permission denied. Please allow access to your camera/microphone.")
+      if (error.name === "NotAllowedError") {
+        alert("Camera/microphone access denied. Please allow access and try again.")
+      } else if (error.name === "NotFoundError") {
+        alert("Camera/microphone not found. Please check your devices.")
       } else {
-        alert(error.message || "Failed to start call. Please check your camera/microphone permissions.")
+        alert("Failed to start call: " + error.message)
       }
       endCall()
     }
@@ -4596,31 +4548,24 @@ function Chat({ currentUser: propCurrentUser }) {
 
       const constraints = {
         audio: true,
-        video:
-          callState.callType === "video"
-            ? {
-                width: { ideal: 1280 },
-                height: { ideal: 720 },
-                facingMode: "user",
-              }
-            : false,
+        video: callState.callType === "video" ? { width: 1280, height: 720, facingMode: "user" } : false,
       }
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints)
       localStreamRef.current = stream
 
-      // Set local video stream and ensure it plays
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream
-        localVideoRef.current.muted = true // Prevent echo
-        localVideoRef.current.play().catch(console.error)
+        localVideoRef.current.muted = true
+        localVideoRef.current.play().catch((e) => console.error("Local video play error:", e))
       }
 
-      const peerConnection = initializePeerConnection()
-      peerConnectionRef.current = peerConnection
+      const pc = createPeerConnection()
+      peerConnectionRef.current = pc
 
       stream.getTracks().forEach((track) => {
-        peerConnection.addTrack(track, stream)
+        console.log("➕ Adding track:", track.kind)
+        pc.addTrack(track, stream)
       })
 
       setCallState((prev) => ({
@@ -4629,42 +4574,46 @@ function Chat({ currentUser: propCurrentUser }) {
         isInCall: true,
       }))
 
-      if (socket) {
-        socket.emit("accept-call", {
-          to: callState.remoteUserId,
-          from: currentUser._id,
-        })
-      }
+      socket.emit("call-accept", {
+        to: callState.remoteUserId,
+        from: currentUser._id,
+      })
     } catch (error) {
       console.error("❌ Error accepting call:", error)
-      alert("Failed to accept call. Please check your camera/microphone permissions.")
+      alert("Failed to accept call: " + error.message)
       rejectCall()
     }
   }
 
   const rejectCall = () => {
     console.log("❌ Rejecting call")
-    if (socket) {
-      socket.emit("reject-call", {
-        to: callState.remoteUserId,
-        from: currentUser._id,
-      })
-    }
+    socket.emit("call-reject", {
+      to: callState.remoteUserId,
+      from: currentUser._id,
+    })
     endCall()
   }
 
   const endCall = () => {
     console.log("📞 Ending call")
 
-    // Clear connection timeout
-    if (connectionTimeout) {
-      clearTimeout(connectionTimeout)
-      setConnectionTimeout(null)
+    // Clear timeouts
+    if (connectionTimeoutRef.current) {
+      clearTimeout(connectionTimeoutRef.current)
+      connectionTimeoutRef.current = null
+    }
+
+    if (callTimerRef.current) {
+      clearInterval(callTimerRef.current)
+      callTimerRef.current = null
     }
 
     // Stop local stream
     if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => track.stop())
+      localStreamRef.current.getTracks().forEach((track) => {
+        track.stop()
+        console.log("🛑 Stopped track:", track.kind)
+      })
       localStreamRef.current = null
     }
 
@@ -4682,21 +4631,15 @@ function Chat({ currentUser: propCurrentUser }) {
       remoteVideoRef.current.srcObject = null
     }
 
-    // Stop call timer
-    if (callTimerRef.current) {
-      clearInterval(callTimerRef.current)
-      callTimerRef.current = null
-    }
-
-    // Emit call end if we're in a call
-    if ((callState.isInCall || callState.isInitiating) && socket) {
-      socket.emit("end-call", {
+    // Emit call end
+    if (callState.isInCall || callState.isInitiating) {
+      socket.emit("call-end", {
         to: callState.remoteUserId || toUser._id,
         from: currentUser._id,
       })
     }
 
-    // Reset call state
+    // Reset states
     setCallState({
       isInCall: false,
       isInitiating: false,
@@ -4708,7 +4651,6 @@ function Chat({ currentUser: propCurrentUser }) {
     setCallDuration(0)
     setIsMuted(false)
     setIsVideoEnabled(true)
-    setRetryCount(0)
   }
 
   const toggleMute = () => {
@@ -4731,81 +4673,126 @@ function Chat({ currentUser: propCurrentUser }) {
     }
   }
 
-  const createOffer = async () => {
-    if (!peerConnectionRef.current || !socket) return
-
-    try {
-      console.log("📡 Creating WebRTC offer")
-
-      // Add more detailed offer options
-      const offerOptions = {
-        offerToReceiveAudio: true,
-        offerToReceiveVideo: callState.callType === "video",
+  // WebRTC signaling handlers
+  const handleCallOffer = useCallback(
+    async ({ from, callType }) => {
+      console.log("📞 Incoming call from:", from, "Type:", callType)
+      if (from === toUser?._id) {
+        setCallState({
+          isInCall: false,
+          isInitiating: false,
+          isReceiving: true,
+          callType,
+          remoteUserId: from,
+        })
       }
+    },
+    [toUser],
+  )
 
-      const offer = await peerConnectionRef.current.createOffer(offerOptions)
-      await peerConnectionRef.current.setLocalDescription(offer)
+  const handleCallAccept = useCallback(
+    async ({ from }) => {
+      console.log("✅ Call accepted by:", from)
+      if (from === toUser?._id) {
+        setCallState((prev) => ({
+          ...prev,
+          isInitiating: false,
+          isInCall: true,
+        }))
 
-      console.log("📡 Sending offer to:", callState.remoteUserId || toUser._id)
-      socket.emit("webrtc-offer", {
-        to: callState.remoteUserId || toUser._id,
-        offer,
-      })
-    } catch (error) {
-      console.error("❌ Error creating offer:", error)
-      handleConnectionFailure()
-    }
-  }
+        // Create and send offer
+        try {
+          const offer = await peerConnectionRef.current.createOffer({
+            offerToReceiveAudio: true,
+            offerToReceiveVideo: callState.callType === "video",
+          })
+          await peerConnectionRef.current.setLocalDescription(offer)
 
-  const handleOffer = async (offer, from) => {
-    if (!peerConnectionRef.current || !socket) return
-
-    try {
-      console.log("📡 Handling WebRTC offer from:", from)
-      await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(offer))
-
-      const answerOptions = {
-        offerToReceiveAudio: true,
-        offerToReceiveVideo: callState.callType === "video",
+          console.log("📤 Sending offer")
+          socket.emit("webrtc-offer", {
+            to: from,
+            offer: offer,
+          })
+        } catch (error) {
+          console.error("❌ Error creating offer:", error)
+          endCall()
+        }
       }
+    },
+    [toUser, callState.callType],
+  )
 
-      const answer = await peerConnectionRef.current.createAnswer(answerOptions)
-      await peerConnectionRef.current.setLocalDescription(answer)
+  const handleCallReject = useCallback(
+    ({ from }) => {
+      console.log("❌ Call rejected by:", from)
+      if (from === toUser?._id) {
+        endCall()
+      }
+    },
+    [toUser],
+  )
 
-      console.log("📡 Sending answer to:", from)
-      socket.emit("webrtc-answer", {
-        to: from,
-        answer,
-      })
-    } catch (error) {
-      console.error("❌ Error handling offer:", error)
-      handleConnectionFailure()
-    }
-  }
+  const handleCallEnd = useCallback(
+    ({ from }) => {
+      console.log("📞 Call ended by:", from)
+      if (from === toUser?._id) {
+        endCall()
+      }
+    },
+    [toUser],
+  )
 
-  const handleAnswer = async (answer) => {
-    if (!peerConnectionRef.current) return
+  const handleWebRTCOffer = useCallback(
+    async ({ from, offer }) => {
+      console.log("📡 Received WebRTC offer from:", from)
+      if (from === toUser?._id && peerConnectionRef.current) {
+        try {
+          await peerConnectionRef.current.setRemoteDescription(offer)
+          const answer = await peerConnectionRef.current.createAnswer()
+          await peerConnectionRef.current.setLocalDescription(answer)
 
-    try {
-      console.log("📡 Handling WebRTC answer")
-      await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer))
-    } catch (error) {
-      console.error("❌ Error handling answer:", error)
-      handleConnectionFailure()
-    }
-  }
+          console.log("📤 Sending answer")
+          socket.emit("webrtc-answer", {
+            to: from,
+            answer: answer,
+          })
+        } catch (error) {
+          console.error("❌ Error handling offer:", error)
+          endCall()
+        }
+      }
+    },
+    [toUser],
+  )
 
-  const handleIceCandidate = async (candidate) => {
-    if (!peerConnectionRef.current) return
+  const handleWebRTCAnswer = useCallback(
+    async ({ from, answer }) => {
+      console.log("📡 Received WebRTC answer from:", from)
+      if (from === toUser?._id && peerConnectionRef.current) {
+        try {
+          await peerConnectionRef.current.setRemoteDescription(answer)
+        } catch (error) {
+          console.error("❌ Error handling answer:", error)
+          endCall()
+        }
+      }
+    },
+    [toUser],
+  )
 
-    try {
-      console.log("🧊 Adding ICE candidate")
-      await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate))
-    } catch (error) {
-      console.error("❌ Error handling ICE candidate:", error)
-      // Don't fail the entire call for ICE candidate errors
-    }
-  }
+  const handleIceCandidate = useCallback(
+    async ({ from, candidate }) => {
+      console.log("🧊 Received ICE candidate from:", from)
+      if (from === toUser?._id && peerConnectionRef.current) {
+        try {
+          await peerConnectionRef.current.addIceCandidate(candidate)
+        } catch (error) {
+          console.error("❌ Error adding ICE candidate:", error)
+        }
+      }
+    },
+    [toUser],
+  )
 
   // Voice recognition functions
   const startListening = () => {
@@ -4823,7 +4810,6 @@ function Chat({ currentUser: propCurrentUser }) {
       recognition.stop()
       setIsListening(false)
 
-      // Auto-send the message after a short delay to ensure transcript is complete
       setTimeout(() => {
         if (transcript.trim() && socket) {
           const messageData = {
@@ -4951,94 +4937,6 @@ function Chat({ currentUser: propCurrentUser }) {
     [id],
   )
 
-  // Call event handlers
-  const handleIncomingCall = useCallback(
-    ({ from, callType }) => {
-      if (from === toUser?._id) {
-        console.log("📞 Incoming call from:", from, "Type:", callType)
-        setCallState({
-          isInCall: false,
-          isInitiating: false,
-          isReceiving: true,
-          callType,
-          remoteUserId: from,
-        })
-      }
-    },
-    [toUser],
-  )
-
-  const handleCallAccepted = useCallback(
-    async ({ from }) => {
-      if (from === toUser?._id) {
-        console.log("✅ Call accepted by:", from)
-        setCallState((prev) => ({
-          ...prev,
-          isInitiating: false,
-          isInCall: true,
-        }))
-        await createOffer()
-      }
-    },
-    [toUser],
-  )
-
-  const handleCallRejected = useCallback(
-    ({ from }) => {
-      if (from === toUser?._id) {
-        console.log("❌ Call rejected by:", from)
-        endCall()
-      }
-    },
-    [toUser],
-  )
-
-  const handleCallEnded = useCallback(
-    ({ from }) => {
-      if (from === toUser?._id) {
-        console.log("📞 Call ended by:", from)
-        endCall()
-      }
-    },
-    [toUser],
-  )
-
-  const handleWebRTCOffer = useCallback(
-    async ({ offer, from }) => {
-      if (from === toUser?._id) {
-        console.log("📡 Received WebRTC offer from:", from)
-        await handleOffer(offer, from)
-      }
-    },
-    [toUser],
-  )
-
-  const handleWebRTCAnswer = useCallback(
-    async ({ answer, from }) => {
-      if (from === toUser?._id) {
-        console.log("📡 Received WebRTC answer from:", from)
-        await handleAnswer(answer)
-      }
-    },
-    [toUser],
-  )
-
-  const handleWebRTCIceCandidate = useCallback(
-    async ({ candidate, from }) => {
-      if (from === toUser?._id) {
-        console.log("🧊 Received ICE candidate from:", from)
-        await handleIceCandidate(candidate)
-      }
-    },
-    [toUser],
-  )
-
-  const handleCallFailed = useCallback(({ reason }) => {
-    console.log("❌ Call failed:", reason)
-    alert(`Call failed: ${reason}`)
-    endCall()
-  }, [])
-
   const checkUserOnline = useCallback(() => {
     if (toUser?._id) {
       socket.emit("check_user_online", { toUserId: toUser._id }, ({ isOnline }) => {
@@ -5056,14 +4954,13 @@ function Chat({ currentUser: propCurrentUser }) {
     socket.on("user_typing", handleTyping)
 
     // Call event listeners
-    socket.on("incoming-call", handleIncomingCall)
-    socket.on("call-accepted", handleCallAccepted)
-    socket.on("call-rejected", handleCallRejected)
-    socket.on("call-ended", handleCallEnded)
+    socket.on("call-offer", handleCallOffer)
+    socket.on("call-accept", handleCallAccept)
+    socket.on("call-reject", handleCallReject)
+    socket.on("call-end", handleCallEnd)
     socket.on("webrtc-offer", handleWebRTCOffer)
     socket.on("webrtc-answer", handleWebRTCAnswer)
-    socket.on("webrtc-ice-candidate", handleWebRTCIceCandidate)
-    socket.on("call-failed", handleCallFailed)
+    socket.on("ice-candidate", handleIceCandidate)
 
     if (currentUser?._id && toUser?._id) {
       const roomId = [currentUser._id, toUser._id].sort().join("_")
@@ -5079,14 +4976,13 @@ function Chat({ currentUser: propCurrentUser }) {
       socket.off("message_read_status", handleReadStatus)
       socket.off("message_delivered_status", handleDeliveryStatus)
       socket.off("user_typing", handleTyping)
-      socket.off("incoming-call", handleIncomingCall)
-      socket.off("call-accepted", handleCallAccepted)
-      socket.off("call-rejected", handleCallRejected)
-      socket.off("call-ended", handleCallEnded)
+      socket.off("call-offer", handleCallOffer)
+      socket.off("call-accept", handleCallAccept)
+      socket.off("call-reject", handleCallReject)
+      socket.off("call-end", handleCallEnd)
       socket.off("webrtc-offer", handleWebRTCOffer)
       socket.off("webrtc-answer", handleWebRTCAnswer)
-      socket.off("webrtc-ice-candidate", handleWebRTCIceCandidate)
-      socket.off("call-failed", handleCallFailed)
+      socket.off("ice-candidate", handleIceCandidate)
       clearInterval(interval)
       if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current)
     }
@@ -5096,14 +4992,13 @@ function Chat({ currentUser: propCurrentUser }) {
     handleReadStatus,
     handleDeliveryStatus,
     handleTyping,
-    handleIncomingCall,
-    handleCallAccepted,
-    handleCallRejected,
-    handleCallEnded,
+    handleCallOffer,
+    handleCallAccept,
+    handleCallReject,
+    handleCallEnd,
     handleWebRTCOffer,
     handleWebRTCAnswer,
-    handleWebRTCIceCandidate,
-    handleCallFailed,
+    handleIceCandidate,
     checkUserOnline,
     currentUser,
     toUser,
